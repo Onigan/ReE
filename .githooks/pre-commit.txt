@@ -1,0 +1,25 @@
+#!/bin/sh
+# Block files >= 100MB from being committed (GitHub hard limit)
+limit=$((100 * 1024 * 1024))
+
+# list staged files (added/modified)
+files=$(git diff --cached --name-only --diff-filter=AM)
+
+blocked=""
+for f in $files; do
+  if [ -f "$f" ]; then
+    size=$(wc -c <"$f" | tr -d ' ')
+    if [ "$size" -ge "$limit" ]; then
+      blocked="$blocked\n$f ($size bytes)"
+    fi
+  fi
+done
+
+if [ -n "$blocked" ]; then
+  echo "ERROR: Files >= 100MB are staged and will be rejected by GitHub:"
+  echo "$blocked"
+  echo "Remove them from staging or add to .gitignore / use Git LFS."
+  exit 1
+fi
+
+exit 0
