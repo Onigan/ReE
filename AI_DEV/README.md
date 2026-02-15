@@ -69,3 +69,4 @@ GitHubは単一オブジェクトが 100MB を超えると push をブロック�
 ```bash
 git config core.hooksPath .githooks
 git config --get core.hooksPath
+- ⚠ Unityプロジェクトでは `git clean -fd` を単独実行しない（未追跡のAssets等を大量削除する危険がある）。実行する場合は必ず `git clean -nd` の出力を共有して合意してから。
