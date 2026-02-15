@@ -1,0 +1,24 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 17aa70c4821b01a42bbf0733e6c2da45, type: 3}
+  m_Name: "\u30B4\u30D6\u30EA\u30F3\u722A"
+  m_EditorClassIdentifier: Assembly-CSharp::ReE.Combat.WeaponDef
+  id: wd_
+  displayName: "\u30B4\u30D6\u30EA\u30F3\u722A"
+  description: 
+  damageType: 4
+  delivery: 0
+  tags: 1
+  basePower: 50
+  category: 0
+  baseTimeCost: 3
+  icon: {fileID: 0}

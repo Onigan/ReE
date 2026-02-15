@@ -1,0 +1,4 @@
+SSOT root: E:\ReE\UnityProject\00_SSOT\
+DRAFT root: E:\ReE\UnityProject\01_DRAFT\
+Specs root: E:\ReE\UnityProject\Specs\
+Logs root: E:\ReE\UnityProject\Logs_SSOT\

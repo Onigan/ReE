@@ -1,0 +1,34 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: ca96760ec3e870e4c8342e491d6a90ab, type: 3}
+  m_Name: SK_DMG_01
+  m_EditorClassIdentifier: Assembly-CSharp::ReE.Combat.Data.SkillData
+  skillId: SK_DMG_01
+  displayName: SK_DMG_01
+  kind: 0
+  basePower: 5
+  targetPolicy: 0
+  defaultTargetSide: 0
+  buffType: 0
+  buffTag: 0
+  buffMagnitude: 0
+  buffDurationSeconds: 0
+  buffStackRule: 0
+  fallbackSkillId: 
+  grantsReactive: 0
+  reactiveType: 0
+  reactiveMagnitude: 0
+  reactiveScope: 
+  reactiveDurationSeconds: 0
+  reactiveStackRule: 0
+  uiSub: 1
+  uiMain: 1

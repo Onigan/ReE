@@ -1,0 +1,27 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 1af91c58d09327242ad2754283cde74e, type: 3}
+  m_Name: "\u706B\u8010\u6027\u30A2\u30FC\u30DE\u30FC"
+  m_EditorClassIdentifier: Assembly-CSharp::Armor
+  armorName: "\u706B\u8010\u6027\u30A2\u30FC\u30DE\u30FC"
+  icon: {fileID: 0}
+  defensePower: 5
+  fireResist: 50
+  waterResist: 0
+  windResist: 0
+  earthResist: 0
+  lightResist: 0
+  darkResist: 0
+  voidResist: 0
+  resistDeath: 0
+  resistFear: 0
+  description: 

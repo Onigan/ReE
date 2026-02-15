@@ -1,0 +1,1185 @@
+using ReE.Stats;
+using ReE.Combat.Effects;
+using ReE;
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using UnityEngine;
+using UnityEngine.Serialization;
+using System.Linq;
+
+namespace ReE.Combat.TimeCore
+{
+    public class BattleTimeManager : MonoBehaviour
+    {
+        [Header("TimeCore Unit-B Settings")]
+        [SerializeField] private float _secondsPerTick = 0.5f; 
+
+        [Header("Windup (Seconds -> Ticks Internal)")]
+        [SerializeField] private float _windupSeconds = 0.6f; 
+        private int _windupTicks;
+
+        [Header("Result Line Delay (Seconds -> Ticks Internal)")]
+        [SerializeField] private float _resultLineDelay = 0.0f;
+        private int _resultLineDelayTicks;
+
+        [Header("Guard Settings (Seconds -> Ticks Internal)")]
+        [SerializeField] private float _guardDuration = 1.2f;
+        private int _guardDurationTicks;
+
+        [SerializeField] private float _perfectGuardWindow = 0.25f;
+        private int _perfectGuardWindowTicks;
+
+        [SerializeField] private float _guardDamageRate = 0.6f;
+        [SerializeField] private float _perfectGuardDamageRate = 0.2f;
+
+        [Header("Actors")]
+        [SerializeField] private CharacterRuntime _playerActor;
+        [SerializeField] private CharacterRuntime _enemyActor;
+        [FormerlySerializedAs("Actors")][SerializeField] private List<CharacterRuntime> _actors = new List<CharacterRuntime>();
+        
+        // Packet 008.10R: Difficulty + No-Numbers Gate
+        public enum Difficulty { Dev, Easy, Normal, Hard, Immersive, NoHUD, Hardcore }
+        [Header("Difficulty Settings")]
+        [SerializeField] private Difficulty _difficulty = Difficulty.Normal;
+        [SerializeField] private bool _useDifficultyLinkedObservationMode = true;
+        
+        // Packet 008.11: Relief Suggestion
+        [Header("Relief Settings")]
+        [SerializeField] private double _reliefWindowGameSeconds = 63072000.0; // 2 years
+        [SerializeField] private int _reliefTriggerCount = 10;
+        private List<double> _deathHistoryGameTime = new List<double>();
+        private bool _hasSuggestedRelief = false;
+        private long _persistentSessionUt = 0; // For session-based tracking
+
+        // Packet 008.9: Observation Mode
+        public enum ObservationMode { Numeric, ObserveText }
+        [Header("Observation Settings")]
+        [SerializeField] private ObservationMode _observationMode = ObservationMode.Numeric;
+
+        // Packet 008.10R Helper Properties
+        private bool IsNoNumbersDifficulty => 
+            _difficulty == Difficulty.Normal || 
+            _difficulty == Difficulty.Hard || 
+            _difficulty == Difficulty.Immersive || 
+            _difficulty == Difficulty.NoHUD || 
+            _difficulty == Difficulty.Hardcore;
+        
+        private ObservationMode EffectiveObservationMode => IsNoNumbersDifficulty ? ObservationMode.ObserveText : _observationMode;
+
+        [Header("Data Source (Packet_007)")]
+        [SerializeField] private ReE.Combat.Data.SkillDatabase _skillDB;
+
+        public IReadOnlyList<CharacterRuntime> ActiveActors => _actors;
+
+        // --- TimeCore Kernel State ---
+        public const long UT_PER_TICK = 8;
+        private long _battleGlobalTimeUt = 0; 
+        private long _lastEventsTimeUt = 0;   
+
+        private bool _turnToggleToEnemy = false; 
+
+        private enum GuardState { None, Guard, Perfect }
+        private struct GuardBuff
+        {
+            public long StartTimeUt;
+            public int DurationTicks;
+            public int PerfectWindowTicks;
+        }
+        private readonly Dictionary<CharacterRuntime, GuardBuff> _guardStates = new Dictionary<CharacterRuntime, GuardBuff>();
+
+        private readonly Queue<QueuedLine> _queue = new Queue<QueuedLine>();
+
+        public bool BattleEnded { get; private set; } = false;
+        public string WinnerName { get; private set; } = "";
+        
+        // Unit-F: BattleOutcome
+        public enum BattleOutcome { Ongoing, Victory, Retreat, Death, Down }
+        public BattleOutcome Outcome { get; private set; } = BattleOutcome.Ongoing;
+        public string BattleResult { get; private set; } = "";
+
+        // Unit-K: Observation Token
+        // Moved to ResearchNoteManager.cs
+        public List<ObservationToken> ObservationTokens = new List<ObservationToken>();
+
+        // Unit-O: Persistence Guard
+        private bool _savedOnce = false;
+
+        // ...
+
+        private void SaveTokens()
+        {
+            if (_savedOnce) return;
+            _savedOnce = true;
+            if (ResearchNoteManager.Instance != null)
+            {
+                ResearchNoteManager.Instance.AppendTokens(ObservationTokens);
+            }
+        }
+
+        // Unit-M: Debuff
+        public enum DebuffType { None, Panic, Slow, Trip }
+        private Dictionary<CharacterRuntime, List<DebuffType>> _debuffs = new Dictionary<CharacterRuntime, List<DebuffType>>();
+        
+        // Unit-R: Unique Display Names
+        private Dictionary<CharacterRuntime, string> _uniqueDisplayNames = new Dictionary<CharacterRuntime, string>();
+
+        private struct QueuedLine
+        {
+            public long eventTimeUt; 
+            public string text;
+            public Action onDequeue;
+            public QueuedLine(long t, string txt, Action a = null) { eventTimeUt = t; text = txt; onDequeue = a; }
+        }
+
+        private void Awake()
+        {
+            if (_secondsPerTick <= 0.001f) _secondsPerTick = 0.5f; 
+            _windupTicks = Mathf.CeilToInt(_windupSeconds / _secondsPerTick);
+            _resultLineDelayTicks = Mathf.CeilToInt(_resultLineDelay / _secondsPerTick);
+            _guardDurationTicks = Mathf.CeilToInt(_guardDuration / _secondsPerTick);
+            _perfectGuardWindowTicks = Mathf.CeilToInt(_perfectGuardWindow / _secondsPerTick);
+        }
+
+        private void Start()
+        {
+            ApplyDifficultySettings(); // Packet 008.10
+
+            // Actor Discovery
+            bool pFound = (_playerActor != null);
+            bool eFound = (_enemyActor != null);
+
+            if (!pFound || !eFound)
+            {
+                if (_actors == null || _actors.Count == 0)
+                {
+#if UNITY_2023_1_OR_NEWER
+                    var found = UnityEngine.Object.FindObjectsByType<CharacterRuntime>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+#else
+                    var found = FindObjectsOfType<CharacterRuntime>();
+#endif
+                    if (found != null) _actors.AddRange(found);
+                }
+                if (!pFound) { _playerActor = FindActorByName("Player") ?? FindActorByName("Hero"); pFound = (_playerActor != null); }
+                if (!eFound) { _enemyActor = FindActorByName("Enemy") ?? FindActorByName("Boss") ?? FindActorByName("Monster"); eFound = (_enemyActor != null); }
+            }
+
+            if (!pFound && _actors.Count > 0) _playerActor = _actors[0];
+            if (!eFound) {
+                if (_actors.Count > 1) _enemyActor = _actors[1];
+                else if (_actors.Count > 0 && _actors[0] != _playerActor) _enemyActor = _actors[0]; 
+            }
+
+            if (_playerActor != null && !_actors.Contains(_playerActor)) _actors.Add(_playerActor);
+            if (_enemyActor != null && !_actors.Contains(_enemyActor)) _actors.Add(_enemyActor);
+
+            // Unit-R: Initialize Unique Names (Format A)
+            InitializeUniqueNames();
+        }
+        
+        private void InitializeUniqueNames()
+        {
+            _uniqueDisplayNames.Clear();
+            var nameCounts = new Dictionary<string, int>();
+
+            // Pass 1: Count names
+            foreach (var a in _actors)
+            {
+                if (a == null) continue;
+                string baseName = GetBaseDisplayName(a);
+                if (!nameCounts.ContainsKey(baseName)) nameCounts[baseName] = 0;
+                nameCounts[baseName]++;
+            }
+
+            // Pass 2: Assign names
+            var nameIndex = new Dictionary<string, int>();
+            foreach (var a in _actors)
+            {
+                if (a == null) continue;
+                string baseName = GetBaseDisplayName(a);
+                
+                if (nameCounts[baseName] > 1)
+                {
+                    if (!nameIndex.ContainsKey(baseName)) nameIndex[baseName] = 0;
+                    int idx = nameIndex[baseName];
+                    string suffix = GetAlphaSuffix(idx); // A, B, C...
+                    _uniqueDisplayNames[a] = $"{baseName}{suffix}";
+                    nameIndex[baseName]++;
+                }
+                else
+                {
+                    _uniqueDisplayNames[a] = baseName;
+                }
+            }
+        }
+
+        private string GetAlphaSuffix(int index)
+        {
+            // 0->A, 1->B ... 25->Z, 26->AA? For Alpha, simple A-Z is enough.
+            if (index < 0) return "";
+            if (index < 26) return ((char)('A' + index)).ToString();
+            return (index + 1).ToString(); // Fallback for huge numbers
+        }
+
+        private CharacterRuntime FindActorByName(string keyword)
+        {
+            foreach (var a in _actors) {
+                if (a == null) continue;
+                if (a.name.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0) return a;
+                if (GetActorKey(a).IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0) return a;
+            }
+            return null;
+        }
+
+        public bool TryDequeue(out float delaySeconds, out string text)
+        {
+            if (_queue.Count == 0 && _turnToggleToEnemy)
+            {
+                if (!BattleEnded) EnqueueEnemyTurn();
+                _turnToggleToEnemy = false;
+            }
+
+            if (_queue.Count == 0)
+            {
+                delaySeconds = 0f; text = null; return false;
+            }
+
+            var q = _queue.Dequeue();
+            long deltaUt = q.eventTimeUt - _battleGlobalTimeUt;
+            if (deltaUt < 0) deltaUt = 0; 
+
+            _battleGlobalTimeUt = q.eventTimeUt; 
+
+            double secondsPerUt = _secondsPerTick / (double)UT_PER_TICK;
+            delaySeconds = (float)(deltaUt * secondsPerUt);
+
+            text = q.text;
+            q.onDequeue?.Invoke();
+
+            return true;
+        }
+
+        public int QueueCount => _queue.Count;
+        public bool IsBusy => _queue.Count > 0;
+        
+        // Packet_008.3: Debug Auto-Resolve
+        public void DebugProcessUntilIdle(int safety = 64)
+        {
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            int count = 0;
+            while (IsBusy)
+            {
+                if (count >= safety)
+                {
+                    Debug.LogWarning($"[BTM] DebugProcessUntilIdle: Loop safety limit reached ({safety}). Aborting.");
+                    break;
+                }
+
+                if (TryDequeue(out float delay, out string text))
+                {
+                    // Invoke logic done by TryDequeue.
+                    // Log for visibility in Console since UI isn't consuming it
+                    Debug.Log($"[BTM-Debug] {text}");
+                }
+                count++;
+            }
+#endif
+        }
+        
+        // --- Unit-G/J: Intent Entry ---
+        public void EnqueueIntent(ActionIntent intent)
+        {
+            if (intent == null) return;
+
+            // Packet_008.2: Intent Log (User Request)
+            string uiMainStr = "None";
+            if (!string.IsNullOrEmpty(intent.libraryId) && _skillDB != null)
+            {
+                var s = _skillDB.FindById(intent.libraryId);
+                if (s != null) uiMainStr = s.uiMain.ToString();
+            }
+            string targetStr = (intent.targetIds.Count > 0) ? intent.targetIds[0] : "None";
+            string freeTextLog = string.IsNullOrEmpty(intent.freeTextMeta) ? "" : $" freeText='{intent.freeTextMeta}'";
+            EnqueueLine(0, $"[Intent] type={intent.type} uiMain={uiMainStr} skill={intent.libraryId} target={targetStr}{freeTextLog}");
+
+
+            // Packet_007.4: Time Progression (Action-Based MVP)
+            if (ReEFeatureFlags.EnablePacket007_4_BuffEffectMinimal)
+            {
+                TickAllEffects(5.0f); // 5 seconds logical step per action
+            }
+
+            // Packet_008.4: IntentType Dispatch
+            // Replaces string-based intentType check and partial feature flags
+            
+            switch (intent.type)
+            {
+                case IntentType.NormalAttack:
+                    {
+                        string t = (intent.targetIds.Count > 0) ? intent.targetIds[0] : "Enemy";
+                        EnqueuePlayerNormalAttack("Player", t, intent);
+                    }
+                    break;
+
+                case IntentType.Defend:
+                    EnqueuePlayerGuard();
+                    break;
+
+                case IntentType.Skill:
+                case IntentType.Magic:
+                    {
+                        if (_skillDB == null)
+                        {
+                            EnqueueLine(0, "[Intent] SkillDB is null");
+                            return;
+                        }
+                        
+                        var skill = _skillDB.FindById(intent.libraryId);
+                        if (skill == null)
+                        {
+                            EnqueueLine(0, $"[Intent] skill not found id={intent.libraryId}");
+                            // Fallback to Root? intent implies we already committed. 
+                            // Just log and do nothing (end turn essentially, or returns to idle).
+                            return; 
+                        }
+
+                        // Packet_007.3: Policy Check (Moved here)
+                        if (ReEFeatureFlags.EnablePacket007_3_TargetSideMinimal)
+                        {
+                             // Logic from previous implementation
+                             // We don't modify intent.targetSide logic deep here, but we can check policy.
+                             // Actually, just pass to EnqueueSkill?
+                             // Previous logic mutated intent.targetSide.
+                             if (skill.targetPolicy == ReE.Combat.Data.TargetPolicy.EnemyOnly && intent.targetSide == ReE.Combat.Data.TargetSide.Ally)
+                             {
+                                 EnqueueLine(0, "[P073 TargetPolicyBlock(EnemyOnly)]");
+                                 intent.targetSide = ReE.Combat.Data.TargetSide.Enemy;
+                             }
+                             else if (skill.targetPolicy == ReE.Combat.Data.TargetPolicy.AllyOnly && intent.targetSide == ReE.Combat.Data.TargetSide.Enemy)
+                             {
+                                 EnqueueLine(0, "[P073 TargetPolicyBlock(AllyOnly)]");
+                                 intent.targetSide = ReE.Combat.Data.TargetSide.Ally; 
+                             }
+                        }
+
+                        EnqueueSkill(intent, skill);
+                    }
+                    break;
+
+                case IntentType.Observe:
+                    // Unit-K
+                    EnqueueObserve(intent.actorId, intent.targetIds);
+                    break;
+                
+                case IntentType.Retreat:
+                    TryRequestRetreat();
+                    break;
+
+                default:
+                    EnqueueLine(0, $"[Intent] unhandled type={intent.type}");
+                    break;
+            }
+        }
+
+        // Packet_007.2: Skill Execution Entry
+        public void EnqueueSkill(ActionIntent intent, ReE.Combat.Data.SkillData skill)
+        {
+             if (intent == null || skill == null) return;
+
+             // Packet_008.4: Handle Damage Skills
+             // Delegate to Normal Attack Logic (which handles basePower override via libraryId)
+             if (skill.kind == ReE.Combat.Data.SkillKind.Damage)
+             {
+                 string t = (intent.targetIds.Count > 0) ? intent.targetIds[0] : "Enemy";
+                 EnqueuePlayerNormalAttack("Player", t, intent);
+                 return;
+             }
+
+             var actor = ResolveActorRuntime("Player");
+             var actorDisp = GetDisplayName(actor);
+
+             // Packet_008.5: Field Gating
+             // Only access Buff/Reactive fields if logic requires them.
+
+             if (skill.kind == ReE.Combat.Data.SkillKind.Heal)
+             {
+                 EnqueueLine(0, $"[P072 SkillHeal(Id={skill.skillId},Amt={skill.basePower})]");
+                 EnqueueLine(0, $"{actorDisp}の{skill.displayName}！");
+
+                 EnqueueLine(_windupTicks, "...", () => {
+                     var s = ResolveTargetStatus(intent);
+                     if (s != null)
+                     {
+                         if (ReEFeatureFlags.EnablePacket007_5_ReactiveMinimal)
+                         {
+                             int applied; string note;
+                             // Packet_008.5: Reactive Gating (grantsReactive check inside logic? No, check here)
+                             // Wait, TryApplyHeal_WithReactive logic assumes reactive interaction check is internal to Status.
+                             // But does the SKILL apply a reactive effect? Heal usually doesn't APPLY a buff,
+                             // it triggers reactive effects ON the target. 
+                             // So gating 'grantsReactive' for Heal is irrelevant unless Heal ITSELF grants a side-effect.
+                             // Current spec: Heal acts as 'Heal' event. Target's existing Reactives react to it.
+                             // So we don't pass skill.reactiveXXX here.
+                             
+                             if (s.TryApplyHeal_WithReactive(skill.basePower, out applied, out note, skill.skillId))
+                             {
+                                  EnqueueLine(_resultLineDelayTicks, $"{s.DisplayName}は回復した！{BuildHpText(s)}");
+                             }
+                             else
+                             {
+                                  if (note == "InvertedToDamage") EnqueueLine(_resultLineDelayTicks, $"{s.DisplayName}はダメージを受けた！{BuildHpText(s)}");
+                                  else EnqueueLine(_resultLineDelayTicks, "しかし効果はかき消された！");
+                             }
+                         }
+                         else
+                         {
+                             s.ApplyHeal(skill.basePower);
+                             EnqueueLine(_resultLineDelayTicks, $"{s.DisplayName}は回復した！{BuildHpText(s)}");
+                         }
+                     }
+                 });
+             }
+             else if (skill.kind == ReE.Combat.Data.SkillKind.Buff)
+             {
+                 EnqueueLine(0, $"{actorDisp}の{skill.displayName}！");
+                 
+                 EnqueueLine(_windupTicks, "...", () => {
+                     var s = ResolveTargetStatus(intent);
+                     if (s != null)
+                     {
+                         var eff = new ReE.Combat.Effects.ActiveEffect {
+                             effectId = skill.skillId,
+                             sourceSkillId = skill.skillId
+                         };
+                         
+                         // Packet_008.5: Strict Gating for Reactive / Buff
+                         
+                         if (ReEFeatureFlags.EnablePacket007_5_ReactiveMinimal && skill.grantsReactive)
+                         {
+                             // User Request: Explicit log for skipping standard buff
+                             EnqueueLine(0, $"[Buff] Skipped (ReactiveOnly): {skill.skillId}");
+                             
+                             // Packet_008.5: Combat Feel Log (Reactive Granted)
+                             EnqueueLine(0, $"[Reactive] Granted: skillId={skill.skillId} type={skill.reactiveType} scope={skill.reactiveScope}");
+
+                             eff.isReactive = true;
+                             eff.reactiveType = skill.reactiveType;
+                             eff.reactiveMagnitude = skill.reactiveMagnitude;
+                             eff.reactiveScope = skill.reactiveScope;
+                             eff.durationSeconds = skill.reactiveDurationSeconds;
+                             eff.stackRule = skill.reactiveStackRule;
+                         }
+                         else
+                         {
+                             // Packet_008.5: Explicit Buff Type Gating
+                             if (skill.buffType == ReE.Combat.Effects.EffectType.None)
+                             {
+                                 EnqueueLine(0, $"[P074 Warning: Skill '{skill.skillId}' is kind=Buff but buffType is None. Skipped.]");
+                                 return; // Abort apply
+                             }
+
+                             eff.type = skill.buffType;
+                             eff.magnitude = skill.buffMagnitude;
+                             eff.tag = skill.buffTag;
+                             eff.durationSeconds = skill.buffDurationSeconds;
+                             eff.stackRule = skill.buffStackRule;
+                             eff.remainingSeconds = skill.buffDurationSeconds; 
+                         }
+                         
+                         if (!eff.isReactive) eff.remainingSeconds = eff.durationSeconds; 
+                         else eff.remainingSeconds = eff.durationSeconds;
+
+                         bool applied = true;
+                         string note = "";
+
+                         if (ReEFeatureFlags.EnablePacket007_5_ReactiveMinimal)
+                         {
+                             applied = s.TryApplyEffect_WithReactive(eff, out note, skill.skillId);
+                         }
+                         else
+                         {
+                             s.ApplyEffect(eff);
+                         }
+
+                         if (applied)
+                         {
+                             if (eff.isReactive)
+                             {
+                                 // User Request: Explicit log for Reactive application
+                                 EnqueueLine(_resultLineDelayTicks, $"[Reactive] Applied: {skill.skillId} (Type={eff.reactiveType}, Scope={eff.reactiveScope})");
+                             }
+                             else
+                             {
+                                 EnqueueLine(_resultLineDelayTicks, $"[P074 EffectApply(Type={eff.type},Id={eff.effectId},Dur={eff.durationSeconds},Mag={eff.magnitude},Tag={eff.tag})]");
+                             }
+                         }
+                         else
+                         {
+                             EnqueueLine(_resultLineDelayTicks, "しかし効果はかき消された！");
+                         }
+                     }
+                     else
+                     {
+                         EnqueueLine(_resultLineDelayTicks, $"[P074 BuffApplyFailed(SkillId={skill.skillId},Fallback={skill.fallbackSkillId})]");
+                     }
+                 });
+             }
+        }
+        
+        // Packet_007.4: Tick Driver (Action-Based MVP)
+        private void TickAllEffects(float dt)
+        {
+            if (_playerActor != null) GetStatus(_playerActor)?.TickEffects(dt);
+            if (_enemyActor != null) GetStatus(_enemyActor)?.TickEffects(dt);
+            // Verify _actors if consistent with above
+        }
+        
+        // Packet_007.3: Target Resolution Helper
+        private ReE.Stats.CharacterStatus ResolveTargetStatus(ActionIntent intent)
+        {
+             string tName = (intent.targetIds.Count > 0) ? intent.targetIds[0] : null;
+
+             // Flag OFF or Enemy Side -> Standard Resolution
+             if (!ReEFeatureFlags.EnablePacket007_3_TargetSideMinimal || intent.targetSide == ReE.Combat.Data.TargetSide.Enemy)
+             {
+                 if (string.IsNullOrEmpty(tName)) tName = "Enemy";
+                 var runtime = ResolveActorRuntime(tName);
+                 return GetStatus(runtime);
+             }
+
+             // Ally Side logic
+             if (intent.targetSide == ReE.Combat.Data.TargetSide.Ally)
+             {
+                 CharacterRuntime runtime = null;
+                 if (!string.IsNullOrEmpty(tName))
+                 {
+                      runtime = ResolveActorRuntime(tName);
+                      // Reject if resolved to Enemy actor explicitly
+                      if (runtime == _enemyActor) runtime = null; 
+                 }
+
+                 if (runtime == null)
+                 {
+                      EnqueueLine(0, "[P073 TargetFallback(Self)]");
+                      runtime = _playerActor;
+                 }
+                 return GetStatus(runtime);
+             }
+             return null;
+        }
+
+        // Unit-K: Enqueue Observe
+        public void EnqueueObserve(string actorName, List<string> targetNames)
+        {
+            var actor = ResolveActorRuntime(actorName);
+            if (actor == null && _playerActor != null) actor = _playerActor;
+
+            string targetName = (targetNames != null && targetNames.Count > 0) ? targetNames[0] : "Enemy";
+            // Check if we can verify the target Runtime for better name?
+            var targetActor = ResolveActorRuntime(targetNames != null && targetNames.Count > 0 ? targetNames[0] : "Enemy");
+
+            string targetKey = "Enemy";
+            string targetDisp = "Enemy";
+            if (targetActor != null)
+            {
+                targetKey = GetActorKey(targetActor); // Base Key (e.g. Goblin)
+                targetDisp = GetDisplayName(targetActor); // Unique Name (e.g. Goblin A)
+            }
+
+            var actorDisp = GetDisplayName(actor);
+
+            EnqueueLine(0, $"【観察】{actorDisp}は{targetDisp}を注意深く観察した。", () => {
+                 ObservationTokens.Add(new ObservationToken { 
+                     TargetKey = targetKey, 
+                     TargetDisplayName = targetDisp, 
+                     ObservedAt = _battleGlobalTimeUt 
+                 });
+            });
+            EnqueueLine(4, "..."); 
+            _turnToggleToEnemy = true;
+        }
+
+        public void EnqueuePlayerNormalAttack(string attackerName = "Player", string targetName = "Enemy", ActionIntent intent = null)
+        {
+            if (_playerActor != null && _enemyActor != null) EnqueueNormalAttack(_playerActor, _enemyActor, intent);
+            else EnqueueBasicAttack(attackerName, targetName);
+            _turnToggleToEnemy = true;
+        }
+
+        public void EnqueueEnemyTurn()
+        {
+            // Packet 008.8: AI Turn Weight (Log only, no real-time wait)
+            EnqueueLine(0, "[Enemy] Thinking...");
+            EnqueueLine(4, "...", () => {
+                 if (_playerActor != null && _enemyActor != null) EnqueueNormalAttack(_enemyActor, _playerActor);
+                 else EnqueueBasicAttack("Enemy", "Player");
+            });
+        }
+
+        public void EnqueuePlayerGuard()
+        {
+            if (_playerActor != null) EnqueueGuard(_playerActor);
+            else Debug.LogError("[BTM] PlayerGuard failed: PlayerActor is null.");
+            _turnToggleToEnemy = true;
+        }
+
+        // Unit-F2/L/M/N: Retreat Chance & Penalty
+        public bool TryRequestRetreat()
+        {
+            if (BattleEnded) return false;
+
+            // Chance Calculation
+            float baseChance = 0.70f;
+            float chance = Mathf.Clamp(baseChance, 0.05f, 0.95f);
+
+            bool success = UnityEngine.Random.value < chance;
+
+            if (success)
+            {
+                EnqueueLine(0, "撤退の機会をうかがっている...");
+                EnqueueLine(4, "...", () => {
+                     BattleEnded = true;
+                     Outcome = BattleOutcome.Retreat;
+                     BattleResult = "Retreat";
+                     SaveTokens(); // Unit-O
+                     EnqueueLine(0, "[System] 撤退に成功した。");
+                });
+                return true;
+            }
+            else
+            {
+                EnqueueLine(0, "[System] 撤退に失敗した！");
+
+                AddDebuff(_playerActor, DebuffType.Panic, 15.0f);
+                EnqueueLine(0, $"{GetDisplayName(_playerActor)}は恐慌状態になった！");
+
+                int interruptDelayTicks = 8; 
+                EnqueueLine(interruptDelayTicks, "...");
+
+                if (_enemyActor != null && _playerActor != null)
+                {
+                     EnqueueLine(0, "[System] 敵が隙を突いて割り込んだ！");
+                     EnqueueNormalAttack(_enemyActor, _playerActor);
+                }
+                else
+                {
+                     EnqueueLine(0, "[System] 敵が隙を突いて割り込んだ！");
+                     EnqueueBasicAttack("Enemy", "Player");
+                }
+
+                EnqueueLine(10, "逃げ場を探している...");
+
+                return false;
+            }
+        }
+        
+        // Unit-M: Debuff Helper
+        public void AddDebuff(CharacterRuntime target, DebuffType type, float duration)
+        {
+            if (target == null) return;
+            if (!_debuffs.ContainsKey(target)) _debuffs[target] = new List<DebuffType>();
+            _debuffs[target].Add(type);
+        }
+
+        public void EnqueueGuard(CharacterRuntime actor)
+        {
+            if (actor == null) return;
+            long startTimeUt = GetNextScheduleBaseUt();
+            _guardStates[actor] = new GuardBuff { StartTimeUt = startTimeUt, DurationTicks = _guardDurationTicks, PerfectWindowTicks = _perfectGuardWindowTicks };
+            var disp = GetDisplayName(actor);
+            EnqueueLine(0, $"{disp}は身構えた。");
+            // Packet_008.5: Combat Feel Log (Guard Start)
+            EnqueueLine(0, $"[Guard] {disp} is guarding (next hit reduced)");
+        }
+
+        public void EnqueueNormalAttack(CharacterRuntime attacker, CharacterRuntime target, ActionIntent intent = null)
+        {
+            // Unit-N: No IsBusy check to allow interrupt piping
+
+            if (attacker == null || target == null) { EnqueueLine(0, "[System] エラー：攻撃者または対象が不明です。"); return; }
+// ... (omitted) ...
+        }
+        
+// ... (omitted) ...
+
+        private int CalculateFinalDamage(CharacterRuntime attacker, CharacterRuntime target, int baseDamage)
+        {
+            if (target == null) return baseDamage;
+            float multiplier = 1.0f;
+            string guardText = "";
+
+            if (_guardStates.TryGetValue(target, out var buff))
+            {
+                long hitTimeUt = _battleGlobalTimeUt;
+                long elapsedUt = hitTimeUt - buff.StartTimeUt;
+                long durationUt = buff.DurationTicks * UT_PER_TICK;
+                long windowUt = buff.PerfectWindowTicks * UT_PER_TICK;
+
+                if (elapsedUt >= 0 && elapsedUt <= durationUt) {
+                    if (elapsedUt <= windowUt) { multiplier = _perfectGuardDamageRate; guardText = "ジャストガード！(大軽減)"; }
+                    else { multiplier = _guardDamageRate; guardText = "ガード！(軽減)"; }
+                }
+            }
+
+            int finalDmg = Mathf.FloorToInt(baseDamage * multiplier);
+            finalDmg = Mathf.Max(0, finalDmg);
+
+            if (!string.IsNullOrEmpty(guardText)) EnqueueLine(0, guardText);
+
+            // Packet_008.5: Combat Feel Log (Reduction)
+            if (finalDmg < baseDamage)
+            {
+                EnqueueLine(0, FormatReductionLog(baseDamage, finalDmg));
+            }
+
+            return finalDmg;
+        }
+
+            var atkStatus = GetStatus(attacker);
+            var tgtStatus = GetStatus(target);
+            if (atkStatus == null || tgtStatus == null || atkStatus.IsDead || tgtStatus.IsDead) return;
+
+            var attackerDisp = GetDisplayName(attacker);
+            var targetDisp = GetDisplayName(target);
+
+            EnqueueLine(0, $"{attackerDisp}の攻撃！");
+
+            EnqueueLine(_windupTicks, "...", () => 
+            {
+                if (atkStatus.IsDead || tgtStatus.IsDead) return;
+                if (atkStatus.IsDead || tgtStatus.IsDead) return;
+                int baseDmg = Mathf.Max(1, atkStatus.ATK - tgtStatus.DEF);
+
+                // Packet_007.1: Skill Effect Mapping Minimal (BasePower Override)
+                if (ReEFeatureFlags.EnablePacket007_1_SkillEffectMappingMinimal && intent != null && !string.IsNullOrEmpty(intent.libraryId))
+                {
+                    if (_skillDB == null)
+                    {
+                        EnqueueLine(0, "[P071 SkillDB Missing]");
+                    }
+                    else
+                    {
+                        var skill = _skillDB.FindById(intent.libraryId);
+                        if (skill == null)
+                        {
+                            EnqueueLine(0, $"[P071 Skill Missing(Id={intent.libraryId})]");
+                        }
+                        else
+                        {
+                            int pre = baseDmg;
+                            baseDmg = skill.basePower; // Override as Base Power (Interpretation B)
+                            
+                            // Log P071
+                            string logTag = $"[P071 SkillMap(Id={skill.skillId},Base={skill.basePower})] [P071 SkillAmt(Pre={pre},Post={baseDmg})]";
+                            
+                            // Router Usage if enabled, or direct Enqueue
+                            if (ReEFeatureFlags.EnablePacket010_LogLayerRouter)
+                            {
+                                // Future: route to Debug Layer
+                                EnqueueLine(0, logTag);
+                            }
+                            else
+                            {
+                                EnqueueLine(0, logTag);
+                            }
+                        }
+                    }
+                }
+
+                // Packet_007.4: Reinforce Hook & Coating Log
+                if (ReEFeatureFlags.EnablePacket007_4_BuffEffectMinimal)
+                {
+                     // Reinforce / Coating
+                     foreach (var eff in atkStatus.ActiveEffects)
+                     {
+                         if (eff.type == ReE.Combat.Effects.EffectType.Reinforce)
+                         {
+                             float mult = 1.0f + eff.magnitude;
+                             baseDmg = Mathf.FloorToInt(baseDmg * mult);
+                             EnqueueLine(0, $"[P074 ReinforceMul(M={eff.magnitude})]");
+                         }
+                         if (eff.type == ReE.Combat.Effects.EffectType.Coating)
+                         {
+                              EnqueueLine(0, $"[P074 CoatingTag({eff.tag})]");
+                         }
+                     }
+                }
+
+                int finalDmg = CalculateFinalDamage(attacker, target, baseDmg);
+
+                tgtStatus.ApplyDamage(finalDmg);
+
+                // Packet_001: Effect System (Conditional Insert)
+                // Packet_001: Effect System (Conditional Insert)
+                if (ReEFeatureFlags.EnableEffectMvp && intent != null)
+                {
+                    // Packet_004.5: Context External Injection (Log-Only)
+                    // Packet_004.7: EffectContext Builder (Responsibility Consolidation)
+                    ReE.Combat.Effects.EffectContext ctx = null;
+
+                    if (ReEFeatureFlags.EnablePacket004_7_EffectContextBuilder)
+                    {
+                        // Packet_005.0: Pass dummy TurnIndex=0 (Log-Only)
+                        // Packet_006.2: Pass Real-Source WeatherId if enabled
+                        // Packet_006.2: Pass Real-Source WeatherId if enabled
+                        string weatherArg = null; // Hotfix-P0: Force null to fix CS0103 (compile error) until 006.2 matches implementation
+                        ctx = ReE.Combat.Effects.EffectContextBuilder.BuildForIntent(0, weatherArg);
+                    }
+                    else if (ReEFeatureFlags.EnablePacket004_5_ContextExternalInjection)
+                    {
+                        ctx = new ReE.Combat.Effects.EffectContext();
+                        
+                        // Packet_004.6: Context Payload Skeleton (Log-Only)
+                        if (ReEFeatureFlags.EnablePacket004_6_ContextPayloadSkeleton)
+                        {
+                            ctx.BattleState = new ReE.Combat.Effects.BattleStateSnapshot
+                            {
+                                TurnIndex = null, // Fixed per user request
+                                WeatherId = null,
+                                EncounterSeed = null
+                            };
+                        }
+                    }
+
+                    var events = EffectRunner.Execute(intent, attacker, target, ctx);
+                    EffectApplier.Apply(events, attacker, target, ctx);
+
+                    // Packet_002: Fact Log Bridge (Safe Insert)
+                    if (ReE.ReEFeatureFlags.EnableEffectFactLogBridge && events != null && events.Count > 0)
+                    {
+                        var factEvents = ReE.Combat.Logs.FactLogBuilder.FromEffectEvents(events);
+                        if (factEvents != null)
+                        {
+                            foreach (var f in factEvents)
+                            {
+                                if (f == null) continue;
+                                EnqueueLine(0, f.ToDebugLine());
+                            }
+                        }
+                    }
+                }
+
+                var hpText = BuildHpText(tgtStatus);
+                EnqueueLine(_resultLineDelayTicks, FormatDamageLog(targetDisp, finalDmg, hpText, attackerDisp, tgtStatus.MaxHP));
+
+                if (tgtStatus.IsDead)
+                {
+                    EnqueueLine(0, $"{targetDisp} は倒れた。");
+                    EndBattle(attacker.name);
+                }
+            });
+        }
+
+        public void EnqueueBasicAttack(string attackerName, string targetName)
+        {
+            // if (IsBusy) return;
+            var atkRuntime = ResolveActorRuntime(attackerName);
+            var tgtRuntime = ResolveActorRuntime(targetName);
+
+            if (atkRuntime == null || tgtRuntime == null) { EnqueueLine(0, $"[System] 参加者不明: {attackerName} / {targetName}"); return; }
+
+            var atk = GetStatus(atkRuntime);
+            var tgt = GetStatus(tgtRuntime);
+
+            if (atk == null || tgt == null || atk.IsDead || tgt.IsDead) return;
+
+            var attackerDisp = GetDisplayName(atkRuntime);
+            var targetDisp = GetDisplayName(tgtRuntime);
+
+            EnqueueLine(0, $"{attackerDisp}はじっくりと構える。");
+            EnqueueLine(_windupTicks, "...", () => 
+            {
+                if (atk.IsDead || tgt.IsDead) return;
+                int baseDmg = Mathf.Max(1, atk.ATK - tgt.DEF);
+                int finalDmg = CalculateFinalDamage(atkRuntime, tgtRuntime, baseDmg);
+                tgt.ApplyDamage(finalDmg);
+                var hpText = BuildHpText(tgt);
+                EnqueueLine(_resultLineDelayTicks, FormatDamageLog(targetDisp, finalDmg, hpText, attackerDisp, tgt.MaxHP));
+                if (tgt.IsDead) {
+                    EnqueueLine(0, $"{targetDisp} は倒れた。");
+                    EndBattle(attackerName);
+                }
+            });
+        }
+
+        private long GetNextScheduleBaseUt()
+        {
+            long baseUt = _lastEventsTimeUt;
+            if (_battleGlobalTimeUt > baseUt) baseUt = _battleGlobalTimeUt;
+            return baseUt;
+        }
+
+        private void EnqueueLine(int delayTicks, string text, Action action = null)
+        {
+            // Packet_010: Log Layer Router Skeleton (C-10-1)
+            if (ReEFeatureFlags.EnablePacket010_LogLayerRouter)
+            {
+                // Router Logic: Treat 'text' as Facts layer.
+                // Interp/Narr layers are currently empty (Noop).
+                string factsLine = text;
+                // string interpLine = ""; 
+                // string narrLine = "";
+                
+                // For now, pass factsLine through directly to maintain exact behavior.
+                text = factsLine;
+            }
+
+            long baseUt = GetNextScheduleBaseUt();
+            long scheduleUt = baseUt + (delayTicks * UT_PER_TICK);
+            _lastEventsTimeUt = scheduleUt; 
+            _queue.Enqueue(new QueuedLine(scheduleUt, text, action));
+        }
+
+        private int CalculateFinalDamage(CharacterRuntime attacker, CharacterRuntime target, int baseDamage)
+        {
+            if (target == null) return baseDamage;
+            float multiplier = 1.0f;
+            string guardText = "";
+
+            if (_guardStates.TryGetValue(target, out var buff))
+            {
+                long hitTimeUt = _battleGlobalTimeUt;
+                long elapsedUt = hitTimeUt - buff.StartTimeUt;
+                long durationUt = buff.DurationTicks * UT_PER_TICK;
+                long windowUt = buff.PerfectWindowTicks * UT_PER_TICK;
+
+                if (elapsedUt >= 0 && elapsedUt <= durationUt) {
+                    if (elapsedUt <= windowUt) { multiplier = _perfectGuardDamageRate; guardText = "ジャストガード！(大軽減)"; }
+                    else { multiplier = _guardDamageRate; guardText = "ガード！(軽減)"; }
+                }
+            }
+
+            int finalDmg = Mathf.FloorToInt(baseDamage * multiplier);
+            finalDmg = Mathf.Max(0, finalDmg);
+
+            if (!string.IsNullOrEmpty(guardText)) EnqueueLine(0, guardText);
+
+            return finalDmg;
+        }
+
+        private void EndBattle(string winnerName)
+        {
+            if (BattleEnded) return;
+            BattleEnded = true;
+            WinnerName = winnerName;
+            
+            // Unit-F: Determine Outcome
+            if (winnerName == "Player")
+            {
+                Outcome = BattleOutcome.Victory;
+            }
+            else
+            {
+                 // Player Defeated -> Down (Unit-F)
+                 Outcome = BattleOutcome.Down;
+                 // Packet 008.11: Relief Hook
+                 RecordDeathEvent_GameTime();
+            }
+
+            BattleResult = Outcome.ToString();
+            SaveTokens(); // Unit-O
+            EnqueueLine(0, $"[System] 戦闘終了：結果={Outcome}");
+            
+            if (Outcome == BattleOutcome.Down)
+            {
+                 EnqueueLine(0, "[System] Processing P0...");
+            }
+        }
+
+        // Packet 008.8: Debug Reset
+        public void DebugResetBattle()
+        {
+            // Packet 008.11: Persistence Update
+            _persistentSessionUt += _battleGlobalTimeUt;
+
+            BattleEnded = false;
+            Outcome = BattleOutcome.Ongoing;
+            BattleResult = "";
+            _queue.Clear();
+            _battleGlobalTimeUt = 0;
+            _lastEventsTimeUt = 0;
+            _turnToggleToEnemy = false;
+            _guardStates.Clear();
+            _debuffs.Clear();
+            ObservationTokens.Clear();
+            _savedOnce = false;
+
+            // Note: _deathHistoryGameTime and _hasSuggestedRelief are NOT cleared.
+
+            foreach (var a in _actors)
+            {
+                GetStatus(a)?.ResetBattleHP();
+            }
+            EnqueueLine(0, "[Debug] 再戦用リセット（物語上の転生ではない）");
+        }
+
+        // Packet 008.8 Refinement (Updated for 008.10R): Damage Log Helper/Gate
+        private string FormatDamageLog(string targetName, int damage, string hpText, string attackerName = null, int maxHP = 1)
+        {
+             // Packet 008.10R Check
+             if (EffectiveObservationMode == ObservationMode.Numeric)
+             {
+                 if (attackerName != null) return $"{targetName}は{attackerName}に{damage}ダメージ！{hpText}";
+                 return $"{targetName}に{damage}ダメージ！{hpText}";
+             }
+             else // ObserveText
+             {
+                 if (damage <= 0) return $"{targetName}は攻撃を完全に防いだ！"; // or "効いていない"
+
+                 float ratio = 0f;
+                 if (maxHP > 0) ratio = (float)damage / maxHP;
+
+                 string desc = "";
+                 if (ratio < 0.05f) desc = "かすり傷を負った。"; // < 5%
+                 else if (ratio < 0.15f) desc = "軽傷を負った。"; // < 15%
+                 else if (ratio < 0.30f) desc = "痛手を負った。"; // < 30% (Medium)
+                 else if (ratio < 0.50f) desc = "重傷を負った。"; // < 50%
+                 else desc = "致命的な一撃を受けた！"; // >= 50%
+
+                 if (attackerName != null) return $"{targetName}は{attackerName}から{desc}";
+                 return $"{targetName}は{desc}";
+             }
+        }
+
+        private string FormatReductionLog(int original, int reduced)
+        {
+             // Packet 008.10R Check
+             if (EffectiveObservationMode == ObservationMode.Numeric)
+             {
+                 return $"[Guard] Damage reduced: {original} -> {reduced}";
+             }
+             else
+             {
+                 // ObserveText
+                 if (original <= 0) return ""; // Should not happen in guard context often, but safe fallback
+
+                 float saved = original - reduced;
+                 float reductionRate = (float)saved / original;
+
+                 if (reductionRate >= 0.70f) return "完全に受け流した！";
+                 if (reductionRate < 0.30f) return "わずかに受け流した。";
+                 return "勢いを大きく殺した。";
+             }
+        }
+
+        // --- Helpers ---
+        private static object GetMemberValue(object obj, params string[] names) {
+            if (obj == null) return null;
+            var t = obj.GetType();
+            const BindingFlags BF = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            foreach (var n in names) { var p = t.GetProperty(n, BF); if (p != null) return p.GetValue(obj); var f = t.GetField(n, BF); if (f != null) return f.GetValue(obj); }
+            return null;
+        }
+        private static string NormalizeName(string s) { if (string.IsNullOrEmpty(s)) return ""; return s.Trim().Replace("(Clone)", "").Trim(); }
+        public static string GetActorKey(CharacterRuntime a) {
+            if (a == null) return "";
+            var v = GetMemberValue(a, "actorName", "ActorName", "_actorName");
+            if (v is string s && !string.IsNullOrEmpty(s)) return NormalizeName(s);
+            return NormalizeName(a.gameObject.name);
+        }
+
+        // Unit-R: Updated GetDisplayName
+        public string GetDisplayName(CharacterRuntime a) {
+            if (a == null) return "";
+            if (_uniqueDisplayNames != null && _uniqueDisplayNames.TryGetValue(a, out string uniqueName)) return uniqueName;
+
+            // Fallback (e.g. not initialized yet)
+            return GetBaseDisplayName(a);
+        }
+
+        private string GetBaseDisplayName(CharacterRuntime a)
+        {
+            if (a == null) return "";
+            var v = GetMemberValue(a, "displayName", "DisplayName", "_displayName");
+            if (v is string s && !string.IsNullOrEmpty(s)) return NormalizeName(s);
+            return GetActorKey(a);
+        }
+
+        private static CharacterStatus GetStatus(CharacterRuntime a) {
+            if (a == null) return null;
+            var comp = a.GetComponent<CharacterStatus>();
+            if (comp != null) return comp;
+            var v = GetMemberValue(a, "Status", "status", "_status", "characterStatus", "CharacterStatus");
+            if (v is CharacterStatus cs1) return cs1;
+            return null;
+        }
+        private CharacterRuntime ResolveActorRuntime(string actorName) {
+            if (_playerActor != null && IsNameMatch(_playerActor, actorName)) return _playerActor;
+            if (_enemyActor != null && IsNameMatch(_enemyActor, actorName)) return _enemyActor;
+            foreach (var a in _actors) { if (a == null) continue; if (IsNameMatch(a, actorName)) return a; }
+            return null;
+        }
+        private bool IsNameMatch(CharacterRuntime a, string name) {
+            var key = GetActorKey(a);
+            // Also match display name if possible
+            string disp = GetDisplayName(a);
+            if (disp.Equals(name, StringComparison.OrdinalIgnoreCase)) return true;
+
+            if (key.Equals(name, StringComparison.OrdinalIgnoreCase)) return true;
+            if (key.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            return false;
+        }
+        private string BuildHpText(CharacterStatus s) {
+            // Packet 008.10R: No-Numbers Gate
+            if (IsNoNumbersDifficulty) return "";
+
+            if (s == null) return "";
+            object hpObj = GetMemberValue(s, "HP", "CurrentHP", "currentHP", "_hp", "_currentHP");
+            object maxObj = GetMemberValue(s, "MaxHP", "maxHP", "_maxHP");
+            if (hpObj is int hp && maxObj is int max) return $" (HP {hp}/{max})";
+            return "";
+        }
+
+        // Packet 008.10R: Difficulty Logic
+        private void ApplyDifficultySettings()
+        {
+            if (_useDifficultyLinkedObservationMode)
+            {
+                // Link Logic
+                // Dev, Easy -> Usually Numeric (unless blocked by Gate, which isn't the case for Easy/Dev)
+                // Normal+ -> Usually ObserveText
+                
+                if (IsNoNumbersDifficulty)
+                {
+                    // This sets the inspector value for clarity, but EffectiveObservationMode is what matters.
+                    _observationMode = ObservationMode.ObserveText;
+                }
+                else
+                {
+                    _observationMode = ObservationMode.Numeric;
+                }
+                
+                // Logging Effective Result
+                EnqueueLine(0, $"[System] ObservationMode = {EffectiveObservationMode} (Source: Difficulty:{_difficulty})");
+                EnqueueLine(0, $"[System] NoNumbers = {IsNoNumbersDifficulty} (Source: DifficultyGate)");
+            }
+            else
+            {
+                // Manual Override
+                EnqueueLine(0, $"[System] ObservationMode = {EffectiveObservationMode} (Source: ManualOverride)");
+                EnqueueLine(0, $"[System] NoNumbers = {IsNoNumbersDifficulty} (Source: DifficultyGate)");
+            }
+        }
+
+        // Packet 008.11: Relief Logic
+        private void RecordDeathEvent_GameTime()
+        {
+            // Calculate Current Game Time (Seconds)
+            long currentUt = _persistentSessionUt + _battleGlobalTimeUt;
+            double nowGameSec = (double)currentUt / UT_PER_TICK * _secondsPerTick;
+
+            _deathHistoryGameTime.Add(nowGameSec);
+
+            // Filter old entries
+            double cutoff = nowGameSec - _reliefWindowGameSeconds;
+            _deathHistoryGameTime.RemoveAll(t => t < cutoff);
+
+            // Check Trigger
+            if (_deathHistoryGameTime.Count >= _reliefTriggerCount && !_hasSuggestedRelief)
+            {
+                _hasSuggestedRelief = true;
+                EnqueueLine(0, "[System] 難易度を下げると遊びやすくなります（設定から変更可能）");
+            }
+        }
+    }
+}

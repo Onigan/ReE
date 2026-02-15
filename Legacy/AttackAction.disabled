@@ -1,0 +1,49 @@
+using UnityEngine;
+
+/// <summary>
+/// 通常攻撃の行動クラス
+/// BattleManager から呼び出され、実際のダメージ計算を行う
+/// </summary>
+public class AttackAction
+{
+    private Actor _attacker;
+    private Actor _defender;
+
+    public AttackAction(Actor attacker, Actor defender)
+    {
+        _attacker = attacker;
+        _defender = defender;
+    }
+
+    /// <summary>
+    /// 攻撃を実行する
+    /// </summary>
+    public void Execute(LogPanel log)
+    {
+        if (_attacker == null || _defender == null)
+        {
+            log.Push("攻撃できる対象がいない！");
+            return;
+        }
+
+        // 基礎ダメージ計算
+        int baseDamage = Mathf.Max(0, _attacker.ATK - _defender.DEF);
+
+        // 武器パワーを加算（WeaponSOがある前提）
+        if (_attacker.Weapon != null)
+        {
+            baseDamage += _attacker.Weapon.Power;
+        }
+
+        // 耐性計算（ActionResolverを使用）
+        DamageKind kind = _attacker.Weapon ? _attacker.Weapon.DamageKind : DamageKind.Physical;
+        int finalDamage = ActionResolver.ApplyResist(baseDamage, kind, _defender, out int resist);
+
+        // HPを減少させる
+        _defender.HP = Mathf.Clamp(_defender.HP - finalDamage, 0, _defender.MaxHP);
+
+        // ログ出力
+        log.Push($"{_attacker.ActorName} の攻撃！ → {kind} {baseDamage} → 耐性{resist}% → 最終 {finalDamage}ダメージ " +
+                 $"({_defender.ActorName} HP:{_defender.HP}/{_defender.MaxHP})");
+    }
+}
