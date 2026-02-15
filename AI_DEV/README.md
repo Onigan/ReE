@@ -42,3 +42,30 @@
 
 
 
+---
+
+## Packet_001: 100MB事故防止ルール（必須・固定）
+
+### 目的
+Unity開発で起きがちな「巨大ファイル混入」による GitHub 側ブロック（単一オブジェクト 100MB 制限）を、
+**ローカル段階で確実に止める**。  
+GitHubは単一オブジェクトが 100MB を超えると push をブロックする（警告は 50MiB 付近で出る）。  
+大容量が必要な場合は Git LFS 等の別手段を検討する。  
+※制限の根拠：GitHub公式ドキュメント参照。
+
+---
+
+### ルール（絶対）
+1) **100MB以上のファイルは “Gitに入れない”**（例外は別途合意した場合のみ）  
+2) **commit 前に staged を必ず確認**：`git diff --cached`  
+3) **開発は dev ブランチで 1タスク=1Packet**（関係ない変更を混ぜない）  
+4) **事故対応（履歴改変・強制push等）は単独判断しない**（必ず合意してから）
+
+---
+
+### 1回だけ：新PCセットアップ（各PC必須）
+`.githooks/pre-commit` を置くだけでは動かない。clone先PCごとに設定が必要。
+
+```bash
+git config core.hooksPath .githooks
+git config --get core.hooksPath
