@@ -32,3 +32,16 @@ desktop.ini
 *.slnx
 Assets/Fonts/NotoSerifJP-Regular SDF.asset
 Assets/Fonts/NotoSerifJP-Regular SDF.asset.meta
+
+# --- Large Assets (avoid GitHub 100MB limit) ---
+Assets/Fonts/**
+*.psd
+*.tga
+*.tif
+*.tiff
+*.mp4
+*.mov
+*.wav
+*.fbx
+*.zip
+
