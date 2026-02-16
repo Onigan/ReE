@@ -69,4 +69,16 @@ GitHubは単一オブジェクトが 100MB を超えると push をブロック�
 ```bash
 git config core.hooksPath .githooks
 git config --get core.hooksPath
+```
+
 - ⚠ Unityプロジェクトでは `git clean -fd` を単独実行しない（未追跡のAssets等を大量削除する危険がある）。実行する場合は必ず `git clean -nd` の出力を共有して合意してから。
+
+## SSOT Entry
+- SSOTの入口: `AI_DEV/SSOT_INDEX.md`
+
+## 日常フロー（作業者向け）
+1. Packetを決める
+2. AIに依頼
+3. ローカルテスト
+4. commit
+5. push（Actions確認）
