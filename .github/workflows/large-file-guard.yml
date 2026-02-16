@@ -1,0 +1,67 @@
+﻿name: Large File Guard
+
+on:
+  pull_request:
+    branches: [ "dev", "main" ]
+  push:
+    branches: [ "dev", "main" ]
+
+jobs:
+  large-file-guard:
+    runs-on: ubuntu-latest
+    env:
+      MAX_BYTES: "100000000" # 100MB (decimal)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine diff range
+        id: range
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "base=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check added/modified file sizes
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ steps.range.outputs.base }}"
+          head="${{ steps.range.outputs.head }}"
+
+          mapfile -d '' files < <(git diff --name-only -z --diff-filter=AM "$base" "$head")
+
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "[Guard] No added/modified files to check."
+            exit 0
+          fi
+
+          max="${MAX_BYTES}"
+          bad=0
+
+          echo "[Guard] Checking ${#files[@]} files (AM) max_bytes=$max"
+          for f in "${files[@]}"; do
+            if [[ ! -f "$f" ]]; then
+              continue
+            fi
+            size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            if [[ "$size" -ge "$max" ]]; then
+              echo "::error file=$f::Large file detected: ${size} bytes (>= ${max})."
+              bad=1
+            fi
+          done
+
+          if [[ "$bad" -ne 0 ]]; then
+            echo "[Guard] FAILED: Large files detected."
+            exit 1
+          fi
+
+          echo "[Guard] OK: No large files detected."
