@@ -1,23 +1,15 @@
-# ReE_Alpha01 – AGENTS (Local SSOT, Method A)
+# ReE_Alpha01 – AGENTS (Local SSOT)
 
-## Single Source of Truth (SSOT)
-- Implementation SSOT is the local project root.
-- SSOT documents: /00_SSOT/
-- Specs & packets: /Specs/
-- Dev notes/logs: /Logs_SSOT/
+## SSOT (Single Source of Truth)
+- SSOT docs live under: `Docs/SSOT/00_SSOT/`
+- SSOT entry: `Docs/SSOT/00_SSOT/SSOT_INDEX.md`
+- Project rules: `Docs/SSOT/00_SSOT/PROJECT_RULES.md`
+- AI reading guide: `Docs/SSOT/00_SSOT/README_AI.md`
+- Dev logs: `Docs/Logs_SSOT/`
+- Specs (non-SSOT memo): `Docs/Specs/`
+- Draft is NOT SSOT: `Docs/DRAFT/` (gitignored)
 
-## Project
-- Unity: 6.2 (6000.2.15f1)
-- Current focus: ReE Combat α1 (TimeCore + Battle UI)
-
-## Rules
-- One task per packet.
-- Small diffs; avoid refactors unless explicitly approved.
-- Always list: changed files + intent + verification steps.
-- If SSOT conflicts with code: stop and ask which is correct.
-
-## SSOT entry points
-- /00_SSOT/00_SSOT_MANIFEST.docx
-- /00_SSOT/00_SSOT_HANDOVER.docx
-- /00_SSOT/00_SSOT_CHANGELOG.docx
-- /00_SSOT/PENDING_REGISTER_COMBAT_SSOT_v1.docx
+## Working rules
+- Work on branch: `dev`
+- 1 task = 1 Packet (write acceptance criteria + test steps)
+- If SSOT conflicts with code: STOP and ask which is correct (SSOT-first by default)
