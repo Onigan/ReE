@@ -1,6 +1,7 @@
 ﻿param(
   [string]$Title = "AI_Task",
-  [string]$OutDir = "AI_DEV/Packets"
+  [string]$OutDir = "AI_DEV/Packets",
+  [switch]$SkipVerify
 )
 
 # --- helpers ---
@@ -22,16 +23,18 @@ $safeTitle = ($Title -replace '[\\/:*?"<>| ]','_')
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $outPath = Join-Path $OutDir ("Packet_{0}_{1}.md" -f $ts, $safeTitle)
 
-# --- snapshots ---
-$branchLines    = Run-Git @("rev-parse","--abbrev-ref","HEAD")
-$statusLines    = Run-Git @("status","-sb")
-$lastCommitLines= Run-Git @("log","-1","--oneline")
-$changedLines   = Run-Git @("diff","--name-only")
+# --- snapshots (git) ---
+$branchLines     = Run-Git @("rev-parse","--abbrev-ref","HEAD")
+$statusLines     = Run-Git @("status","-sb")
+$lastCommitLines = Run-Git @("log","-1","--oneline")
+$changedUnstaged = Run-Git @("diff","--name-only")
+$changedStaged   = Run-Git @("diff","--cached","--name-only")
 
-$branch     = ($branchLines | Select-Object -First 1)
-$statusText = ($statusLines -join "`r`n")
-$lastCommit = ($lastCommitLines | Select-Object -First 1)
-$changedText= ($changedLines -join "`r`n")
+$branch      = ($branchLines | Select-Object -First 1)
+$statusText  = ($statusLines -join "`r`n")
+$lastCommit  = ($lastCommitLines | Select-Object -First 1)
+$unstagedTxt = ($changedUnstaged -join "`r`n")
+$stagedTxt   = ($changedStaged -join "`r`n")
 
 # --- SSOT pointers (existence check) ---
 $paths = @(
@@ -42,22 +45,37 @@ $paths = @(
   "AI_DEV/SSOT_INDEX.md",
   "Docs/SSOT/00_SSOT/SSOT_INDEX.md",
   "Docs/SSOT/00_SSOT/PROJECT_RULES.md",
-  "Docs/SSOT/00_SSOT/README_AI.md"
+  "Docs/SSOT/00_SSOT/README_AI.md",
+  "AI_DEV/TOUCH_LIST.md",
+  "AI_DEV/PROMPT_BASE.md",
+  "AI_DEV/VERIFY.ps1"
 )
 
-$existsLines = $paths | ForEach-Object {
-  "{0} : {1}" -f $_, (Test-Path $_)
-}
+$existsLines = $paths | ForEach-Object { "{0} : {1}" -f $_, (Test-Path $_) }
 $existsText = ($existsLines -join "`r`n")
+
+# --- VERIFY (run and capture) ---
+$verifyOutText = "(skipped)"
+$verifyExit = "N/A"
+if (-not $SkipVerify) {
+  if (Test-Path "AI_DEV/VERIFY.ps1") {
+    $verifyLines = & pwsh -NoProfile -File "AI_DEV/VERIFY.ps1" 2>&1
+    $verifyExit = $LASTEXITCODE
+    $verifyOutText = ($verifyLines -join "`r`n")
+  } else {
+    $verifyOutText = "AI_DEV/VERIFY.ps1 not found"
+    $verifyExit = "N/A"
+  }
+}
 
 # --- content (HERE-STRING: safe) ---
 $content = @"
 # Packet_${ts}: $Title
 
-## 0) Intent・井ｽ輔ｒ縺励◆縺・°・・
+## 0) Intent（何をしたいか）
 - 
 
-## 1) Current State・育樟迥ｶ・・
+## 1) Current State（現状）
 - Branch: $branch
 - Last commit: $lastCommit
 
@@ -66,12 +84,17 @@ $content = @"
 $statusText
 \`\`\`
 
-### Changed files (git diff --name-only)
+### Changed files (staged)
 \`\`\`
-$changedText
+$stagedTxt
 \`\`\`
 
-## 2) Source of Truth・域ｭ｣譛ｬ・・
+### Changed files (unstaged)
+\`\`\`
+$unstagedTxt
+\`\`\`
+
+## 2) Source of Truth（正本）
 - SSOT root: Docs/SSOT/00_SSOT/
 - SSOT entry: Docs/SSOT/00_SSOT/SSOT_INDEX.md
 - Rules: Docs/SSOT/00_SSOT/PROJECT_RULES.md
@@ -83,24 +106,30 @@ $changedText
 $existsText
 \`\`\`
 
-## 3) Change Request・亥､画峩隕∵ｱゑｼ・
+## 3) Change Request（変更要求）
 - What:
 - Why:
 - Scope (Supersede):
   - Files to change:
   - Files NOT to change:
 
-## 4) Acceptance Criteria・亥女縺大・繧梧擅莉ｶ・・
+## 4) Acceptance Criteria（受け入れ条件）
 - [ ] 
 
-## 5) Test Steps・医ユ繧ｹ繝域焔鬆・ｼ・
+## 5) Test Steps（テスト手順）
 1) 
 
-## 6) Evidence・郁ｨｼ霍｡・・
+## 6) Verify（自動）
+- VERIFY EXIT CODE: $verifyExit
+
+\`\`\`
+$verifyOutText
+\`\`\`
+
+## 7) Evidence（証跡）
 - Console logs:
 - Screenshots:
 "@
 
-# Write UTF-8
 $content | Set-Content -Encoding utf8 $outPath
-Write-Host "Created: $outPath"
+Write-Host "Created: $outPath"as
