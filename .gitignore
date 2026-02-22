@@ -45,3 +45,7 @@ Assets/Fonts/**
 *.fbx
 *.zip
 Docs/DRAFT/
+
+# AI packet outputs
+AI_DEV/Packets/*.md
+
